@@ -6,3 +6,9 @@
 *.elf
 *.map
 __pycache__/
+
+# Keep project docs local, do not publish in this repo
+/docs/
+
+# Keep project examples local, do not publish in this repo
+/examples/
