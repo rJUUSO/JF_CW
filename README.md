@@ -57,6 +57,26 @@ Build
 - `pio run -t upload --upload-port COM11`
 - `pio run -t uploadfs --upload-port COM11`
 
+Commit and push all changes
+
+From `JUUSOFLUX_COWORKER`:
+
+1. Check status:
+    - `git status`
+2. Stage everything:
+    - `git add -A`
+3. Commit:
+    - `git commit -m "<your message>"`
+4. Sync with remote main before push:
+    - `git pull --rebase origin main`
+5. Push:
+    - `git push origin main`
+
+Notes:
+
+- `docs/` and `examples/` are intentionally ignored in this repository.
+- If rebase reports conflicts, resolve files, then continue with `git rebase --continue` and run `git push origin main`.
+
 Key runtime commands
 
 - `@SYS=HELLO!`
