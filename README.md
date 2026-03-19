@@ -56,6 +56,7 @@ Build
 - `pio run`
 - `pio run -t upload --upload-port COM11`
 - `pio run -t uploadfs --upload-port COM11`
+- select an alternate TOML for `uploadfs` by setting `COWORKER_FS_CONFIG`, for example `set COWORKER_FS_CONFIG=coworker.li7820.toml && pio run -e juusoflux-coworker -t uploadfs --upload-port COM11`
 
 Commit and push all changes
 
@@ -72,10 +73,6 @@ From `JUUSOFLUX_COWORKER`:
 5. Push:
     - `git push origin main`
 
-Notes:
-
-- `docs/` and `examples/` are intentionally ignored in this repository.
-- If rebase reports conflicts, resolve files, then continue with `git rebase --continue` and run `git push origin main`.
 
 Key runtime commands
 
@@ -89,7 +86,7 @@ Key runtime commands
 - `@MQTT=STATUS!`
 - `@MQTT=LAST!`
 - `@MQTT=READ!`
-- `@MQTT=READ:licor/niobrara/output/concentration!`
+- `@MQTT=READ:licor/niobrara/output/concentration/Concentration!`
 - `@GPS=STATUS!`
 - `@GPS=RAW!`
 - `@I2C=SCAN!`
@@ -99,7 +96,7 @@ Key runtime commands
 - `@POLL=ALL!`
 - `@CFG=GET:link.mode!`
 - `@CFG=SET:link.mode=can!`
-- `@CFG=SET:logging.mqtt_topics=licor/niobrara/output/concentration!`
+- `@CFG=SET:logging.mqtt_topics=licor/niobrara/output/concentration/Concentration!`
 - `@CFG=SAVE!`
 - `@CFG=RELOAD!`
 - `@DBG=ENABLE!`
@@ -111,25 +108,26 @@ The coworker uses a HUB-like TOML config model for the sensors that are actually
 
 - `sht4x_addrs = "44"`
 - `bmp280_addrs = "76"`
-- `cache_topics = "licor/niobrara/output/concentration"`
-- `mqtt_topics = "licor/niobrara/output/concentration"`
+- `cache_topics = "licor/niobrara/output/concentration/Concentration"`
+- `mqtt_topics = "licor/niobrara/output/concentration/Concentration"`
 
 MQTT subscription behavior
 
 - each configured MQTT topic is subscribed directly
 - each cache topic is also subscribed directly
-- if a subscribed topic has no wildcard, the coworker also subscribes to its descendant tree (`/.../#`), so a base topic like `licor/niobrara/output/concentration` captures messages such as `licor/niobrara/output/concentration/data`
+- if a configured topic points at a nested JSON object such as `licor/niobrara/output/concentration/Concentration`, the coworker also subscribes to the immediate parent topic so it can extract that child object from the parent JSON payload
 - topic list expansion matches HUB-style bracket syntax, for example `licor/niobrara/output/concentration/[n2o,h2o]`
 - `@MQTT=READ:<topic>!` is restricted by `mqtt.cache_topics`
 - MQTT cache stores structured JSON under topic path segments
-- MQTT fields are flattened dynamically from configured logging topics, so `@POLL=ALL!` exposes discovered fields as `LI7820_<field>=...`
+- MQTT fields are flattened dynamically from configured logging topics, so `@POLL=ALL!` exposes discovered fields as `LI7810_<field>=...`
+- keyed MQTT arrays are collapsed to their primary value when flattened, so payloads like `"H2O":[40.1,1]` emit `LI7810_h2o=40.1` instead of `LI7810_h2o_0` and `LI7810_h2o_1`
 
 Current read commands
 
 - `@I2C=SHT4X:READ!` returns the latest cached temperature and humidity from the first configured SHT4X address that responds
 - `@I2C=BMP280:READ!` returns the latest cached temperature and pressure from the first configured BMP280 address that responds
-- `@MQTT=READ!` returns full cached JSON as `@MQTT=RX:JSON={...}!`
-- `@MQTT=READ:<topic>!` returns cached topic JSON as `@MQTT=RX:TOPIC=...,NAME=LI7820,JSON={...}!`
+- `@MQTT=READ!` returns cached JSON for the configured logging topic as `@MQTT=RX:JSON={...}!`
+- `@MQTT=READ:<topic>!` returns cached topic JSON as `@MQTT=RX:TOPIC=...,NAME=LI7810,JSON={...}!`
 - `@MQTT=READ:<topic>!` returns `@MQTT=ERR:NO_TOPIC_DATA!` when the topic is outside `mqtt.cache_topics` or no cache entry exists
 - `@LINK=ADDR!` returns the coworker `link.node_id`
 - `@I2C=LIST!` returns currently detected I2C addresses
@@ -141,6 +139,8 @@ Cache behavior
 - MQTT samples are cached on arrival (allow-listed by `mqtt.cache_topics`) and `@POLL=ALL!` replies from that cache rather than waiting for a fresh publish
 - SHT4X and BMP280 samples are refreshed in the background and `@POLL=ALL!` replies from the latest fresh cache entry
 - stale cache entries are not emitted as current data in `@POLL=ALL!`
+- `@POLL=ALL!` only emits GPS fields when `[gps].enabled = 1`
+- `@POLL=ALL!` only emits `SHT4X_<addr>_*` and `BMP280_<addr>_*` fields for addresses listed in `[logging]`
 
 Main config groups
 

@@ -32,6 +32,7 @@ constexpr size_t kMqttValueLen = 48;
 constexpr size_t kMqttRawCacheSlots = 128;
 constexpr size_t kMqttRawTopicLen = 96;
 constexpr size_t kMqttRawPayloadLen = 768;
+constexpr size_t kMqttClientBufferSize = 1024;
 constexpr uint32_t kMqttReadWaitMs = 1200;
 
 HardwareSerial LinkSerial(1);
@@ -377,6 +378,65 @@ void mqttBuildTopicCandidates(const String &requestedTopic, String *out, size_t 
   }
 }
 
+bool mqttConfiguredPathMatchesTopic(const String &configuredPath, const String &topic) {
+  const String configured = normalizeTopicPath(configuredPath);
+  const String normalizedTopic = normalizeTopicPath(topic);
+  if (configured.isEmpty() || normalizedTopic.isEmpty()) {
+    return false;
+  }
+
+  if (configured.endsWith("/#")) {
+    const String prefix = configured.substring(0, configured.length() - 2);
+    return normalizedTopic == prefix || normalizedTopic.startsWith(prefix + "/");
+  }
+
+  if (configured.endsWith("/+") || configured == "+") {
+    const int slash = configured.lastIndexOf('/');
+    const String prefix = slash >= 0 ? configured.substring(0, slash) : String("");
+    if (!prefix.isEmpty()) {
+      if (!normalizedTopic.startsWith(prefix + "/")) return false;
+      const String suffix = normalizedTopic.substring(prefix.length() + 1);
+      return suffix.indexOf('/') < 0;
+    }
+    return normalizedTopic.indexOf('/') < 0;
+  }
+
+  return normalizedTopic == configured || normalizedTopic.startsWith(configured + "/");
+}
+
+bool mqttConfiguredListMatchesTopic(const String &listCsv, const String &topic) {
+  String configured[16];
+  size_t count = 0;
+  if (!parseTopicList(listCsv, configured, 16, count)) {
+    return false;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    if (mqttConfiguredPathMatchesTopic(configured[i], topic)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void mqttAppendSubscriptionRoots(const String &listCsv, String *out, size_t cap, size_t &count) {
+  String configured[16];
+  size_t configuredCount = 0;
+  if (!parseTopicList(listCsv, configured, 16, configuredCount)) {
+    return;
+  }
+
+  for (size_t i = 0; i < configuredCount; ++i) {
+    const String normalized = normalizeTopicPath(configured[i]);
+    mqttAppendUniqueTopic(normalized, out, cap, count);
+
+    const int slash = normalized.lastIndexOf('/');
+    if (slash > 0) {
+      mqttAppendUniqueTopic(normalized.substring(0, slash), out, cap, count);
+    }
+  }
+}
+
 String sanitizeMqttKey(const String &input, size_t maxLen = kMqttKeyLen - 1) {
   String out;
   out.reserve(input.length());
@@ -405,6 +465,69 @@ String hexAddr(uint8_t addr) {
   char buf[5];
   snprintf(buf, sizeof(buf), "%02X", addr);
   return String(buf);
+}
+
+String mqttPollFields();
+
+void appendPollField(String &out, const String &key, const String &value) {
+  if (!out.isEmpty()) out += ',';
+  out += key;
+  out += '=';
+  out += value;
+}
+
+void appendGpsPollFields(String &out) {
+  if (!g_cfg.gpsEnabled) return;
+
+  const bool gpsFresh = isFresh(g_gps.lastRxMs);
+  appendPollField(out, "GPS_fix", String(gpsFresh && g_gps.fix ? 1 : 0));
+  appendPollField(out, "GPS_sats", gpsFresh ? String(g_gps.sats) : String("-"));
+  appendPollField(out, "GPS_latitude", gpsFresh && g_gps.fix ? String(g_gps.lat, 6) : String("-"));
+  appendPollField(out, "GPS_longitude", gpsFresh && g_gps.fix ? String(g_gps.lon, 6) : String("-"));
+  appendPollField(out, "GPS_time", gpsFresh && !g_gps.utcTime.isEmpty() ? g_gps.utcTime : String("-"));
+}
+
+void appendSht4xPollFields(String &out) {
+  String tokens[8];
+  size_t count = 0;
+  splitCsv(g_cfg.sht4xAddrs, tokens, 8, count);
+  if (count == 0) return;
+
+  const bool shtOk = g_sht4x.valid && isFresh(g_sht4x.sampleMs);
+  for (size_t i = 0; i < count; ++i) {
+    const uint8_t addr = static_cast<uint8_t>(strtoul(tokens[i].c_str(), nullptr, 16));
+    const String addrTag = hexAddr(addr);
+    const bool addrMatch = shtOk && addr == g_sht4x.addr;
+    appendPollField(out, "SHT4X_" + addrTag + "_temp_c", addrMatch ? String(g_sht4x.tempC, 2) : String("-"));
+    appendPollField(out, "SHT4X_" + addrTag + "_rh_pct", addrMatch ? String(g_sht4x.rhPct, 2) : String("-"));
+  }
+}
+
+void appendBmp280PollFields(String &out) {
+  String tokens[8];
+  size_t count = 0;
+  splitCsv(g_cfg.bmp280Addrs, tokens, 8, count);
+  if (count == 0) return;
+
+  const bool bmpOk = g_bmp280.valid && isFresh(g_bmp280.sampleMs);
+  for (size_t i = 0; i < count; ++i) {
+    const uint8_t addr = static_cast<uint8_t>(strtoul(tokens[i].c_str(), nullptr, 16));
+    const String addrTag = hexAddr(addr);
+    const bool addrMatch = bmpOk && addr == g_bmp280.addr;
+    appendPollField(out, "BMP280_" + addrTag + "_temp_c", addrMatch ? String(g_bmp280.tempC, 2) : String("-"));
+    appendPollField(out, "BMP280_" + addrTag + "_press_pa", addrMatch ? String(g_bmp280.pressurePa, 1) : String("-"));
+  }
+}
+
+String buildPollAllFields() {
+  String out;
+  const bool mqttFresh = isFresh(g_mqtt.lastRxMs);
+  appendPollField(out, "MQTT_age_ms", mqttFresh ? formatAgeMs(g_mqtt.lastRxMs) : String("-"));
+  appendGpsPollFields(out);
+  appendSht4xPollFields(out);
+  appendBmp280PollFields(out);
+  out += mqttPollFields();
+  return out;
 }
 
 bool parseRs485Envelope(const String &line, String &commandOut, String &replyPrefixOut) {
@@ -520,6 +643,7 @@ String mqttNamePrefix() {
 }
 
 bool mqttIsTopicInList(const String &listCsv, const String &topic);
+bool mqttTopicMatchesRequest(const String &requestTopic, const String &cachedTopic);
 String mqttPollFieldsFromCache();
 bool mqttReadRawTopicFromCache(const String &requestedTopic, String &payloadOut);
 
@@ -575,16 +699,6 @@ String mqttFieldValue(const char *key) {
   return "";
 }
 
-String mqttArrayFieldName(size_t idx) {
-  static const char *kKnown[] = {
-      "SECONDS", "NANOSECONDS", "NDX", "DIAG", "H2O", "N2O",
-      "RESIDUAL", "TIME", "T", "ERROR", "SHIFT", "VOLTAGE"};
-  if (idx < (sizeof(kKnown) / sizeof(kKnown[0]))) {
-    return String(kKnown[idx]);
-  }
-  return "A" + String(idx);
-}
-
 String mqttJsonLiteral(const JsonVariantConst &value, size_t maxLen = 160) {
   String out;
   serializeJson(value, out);
@@ -608,12 +722,10 @@ void mqttCollectJsonFields(const JsonVariantConst &value, const String &topicKey
     size_t idx = 0;
     for (JsonVariantConst item : arr) {
       String nextPath = path;
-      if (nextPath.isEmpty()) {
-        nextPath = mqttArrayFieldName(idx);
-      } else {
+      if (!nextPath.isEmpty()) {
         nextPath += '_';
-        nextPath += String(idx);
       }
+      nextPath += String(idx);
       mqttCollectJsonFields(item, topicKey, nextPath, sampleMs);
       idx++;
     }
@@ -705,51 +817,9 @@ String mqttPollFields() {
   return out;
 }
 
-String buildStructuredMqttPayload(const String &rawPayload, String &n2oOut, String &h2oOut, String &diagOut) {
-  String trimmed = rawPayload;
-  trimmed.trim();
-  n2oOut = "-";
-  h2oOut = "-";
-  diagOut = "-";
-  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) {
-    return sanitizeResponseValue(trimmed, 720);
-  }
-
-  JsonDocument doc;
-  const DeserializationError err = deserializeJson(doc, trimmed);
-  if (err || !doc.is<JsonArrayConst>()) {
-    return sanitizeResponseValue(trimmed, 720);
-  }
-
-  JsonArrayConst arr = doc.as<JsonArrayConst>();
-  String payload = "{";
-  size_t idx = 0;
-  for (JsonVariantConst item : arr) {
-    if (idx > 0) payload += ',';
-    payload += '"';
-    payload += mqttArrayFieldName(idx);
-    payload += "\":";
-    payload += mqttJsonLiteral(item, 120);
-
-    if (idx == 3) diagOut = mqttJsonLiteral(item, 24);
-    else if (idx == 4) h2oOut = mqttJsonLiteral(item, 24);
-    else if (idx == 5) n2oOut = mqttJsonLiteral(item, 24);
-
-    idx++;
-  }
-  payload += "}";
-  return sanitizeResponseValue(payload, 720);
-}
-
 String buildMqttRxLine() {
   const String topic = g_mqtt.lastTopic.isEmpty() ? String("-") : sanitizeResponseValue(g_mqtt.lastTopic, 96);
-  String payload = "-";
-  if (!g_mqtt.lastPayload.isEmpty()) {
-    String ignoredN2o;
-    String ignoredH2o;
-    String ignoredDiag;
-    payload = buildStructuredMqttPayload(g_mqtt.lastPayload, ignoredN2o, ignoredH2o, ignoredDiag);
-  }
+  const String payload = g_mqtt.lastPayload.isEmpty() ? String("-") : sanitizeResponseValue(g_mqtt.lastPayload, 720);
   return "@MQTT=RX:TOPIC=" + topic + ",NAME=" + sanitizeResponseValue(g_cfg.mqttName, 24) + ",PAYLOAD=" + payload + "!";
 }
 
@@ -1052,11 +1122,8 @@ bool mqttPayloadLooksArray(const String &payload) {
 }
 
 String mqttCanonicalTopic(const String &topic, const String &payload) {
-  String canonical = normalizeTopicPath(topic);
-  if (mqttPayloadLooksArray(payload) && canonical.endsWith("/data")) {
-    canonical.remove(canonical.length() - 5);
-  }
-  return canonical;
+  (void)payload;
+  return normalizeTopicPath(topic);
 }
 
 bool mqttTopicEquals(const String &lhs, const String &rhs) {
@@ -1089,12 +1156,6 @@ int mqttTopicDistance(const String &lhs, const String &rhs) {
 }
 
 String mqttFormatPayloadForRead(const String &topic, const String &payload) {
-  String ignoredN2o;
-  String ignoredH2o;
-  String ignoredDiag;
-  if (mqttPayloadLooksArray(payload)) {
-    return buildStructuredMqttPayload(payload, ignoredN2o, ignoredH2o, ignoredDiag);
-  }
   return sanitizeResponseValue(payload, 720);
 }
 
@@ -1240,6 +1301,66 @@ bool mqttExtractPayloadByPath(const String &payloadJson, const String &subPath, 
   return true;
 }
 
+bool mqttResolveConfiguredTopicPayload(const String &configuredTopic,
+                                      const String &incomingTopic,
+                                      const String &incomingPayload,
+                                      String &resolvedPayloadOut) {
+  const String configured = normalizeTopicPath(configuredTopic);
+  const String incoming = normalizeTopicPath(incomingTopic);
+  if (configured.isEmpty() || incoming.isEmpty()) return false;
+
+  if (mqttConfiguredPathMatchesTopic(configured, incoming)) {
+    resolvedPayloadOut = incomingPayload;
+    return true;
+  }
+
+  String nestedSuffix;
+  if (!mqttTryTopicSuffix(incoming, configured, nestedSuffix)) {
+    return false;
+  }
+
+  return mqttExtractPayloadByPath(incomingPayload, nestedSuffix, resolvedPayloadOut);
+}
+
+void mqttResolveConfiguredTopicPayloads(const String &listCsv,
+                                       const String &incomingTopic,
+                                       const String &incomingPayload,
+                                       String *topicsOut,
+                                       String *payloadsOut,
+                                       size_t cap,
+                                       size_t &count) {
+  count = 0;
+  if (cap == 0) return;
+
+  String configured[16];
+  size_t configuredCount = 0;
+  if (!parseTopicList(listCsv, configured, 16, configuredCount)) {
+    return;
+  }
+
+  for (size_t i = 0; i < configuredCount && count < cap; ++i) {
+    String resolvedPayload;
+    if (!mqttResolveConfiguredTopicPayload(configured[i], incomingTopic, incomingPayload, resolvedPayload)) {
+      continue;
+    }
+
+    const String normalizedTopic = normalizeTopicPath(configured[i]);
+    bool seen = false;
+    for (size_t j = 0; j < count; ++j) {
+      if (mqttTopicEquals(topicsOut[j], normalizedTopic)) {
+        payloadsOut[j] = resolvedPayload;
+        seen = true;
+        break;
+      }
+    }
+    if (seen) continue;
+
+    topicsOut[count] = normalizedTopic;
+    payloadsOut[count] = resolvedPayload;
+    count++;
+  }
+}
+
 bool mqttFindExactRawTopic(const String &topic, String &payloadOut) {
   for (size_t i = 0; i < kMqttRawCacheSlots; ++i) {
     if (!g_mqtt.raw[i].used) continue;
@@ -1327,7 +1448,7 @@ bool mqttTopicMatchesSubscriptionFilter(const String &subscriptionTopic, const S
 
 bool mqttTopicAllowedForSummary(const String &topic, const String &payload) {
   const String canonical = mqttCanonicalTopic(topic, payload);
-  return mqttIsTopicInList(g_cfg.mqttTopics, canonical) || mqttIsTopicInList(g_cfg.mqttTopics, topic);
+  return mqttConfiguredListMatchesTopic(g_cfg.mqttTopics, canonical) || mqttConfiguredListMatchesTopic(g_cfg.mqttTopics, topic);
 }
 
 bool mqttPathStartsWith(const String &path, const String &prefix) {
@@ -1386,6 +1507,85 @@ bool mqttFindObjectKeyIgnoreCase(JsonObjectConst obj, const String &segment, Str
   return false;
 }
 
+void mqttMergeCacheValue(JsonVariant dst, const JsonVariantConst &src);
+
+bool mqttJsonFindPath(const JsonVariantConst &root, const String &path, JsonVariantConst &valueOut) {
+  JsonVariantConst current = root;
+  if (path.isEmpty()) {
+    valueOut = current;
+    return true;
+  }
+
+  String segments[20];
+  size_t count = 0;
+  mqttSplitTopicPath(normalizeTopicPath(path), segments, 20, count);
+  if (count == 0) {
+    valueOut = current;
+    return true;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    const String &segment = segments[i];
+    if (current.is<JsonObjectConst>()) {
+      JsonObjectConst obj = current.as<JsonObjectConst>();
+      String resolved;
+      if (!mqttFindObjectKeyIgnoreCase(obj, segment, resolved)) return false;
+      current = obj[resolved];
+      if (current.isNull()) return false;
+      continue;
+    }
+
+    if (current.is<JsonArrayConst>()) {
+      bool numeric = !segment.isEmpty();
+      for (size_t j = 0; j < segment.length(); ++j) {
+        if (!isdigit(static_cast<unsigned char>(segment[j]))) {
+          numeric = false;
+          break;
+        }
+      }
+      if (!numeric) return false;
+
+      const int index = segment.toInt();
+      JsonArrayConst arr = current.as<JsonArrayConst>();
+      if (index < 0 || static_cast<size_t>(index) >= arr.size()) return false;
+      current = arr[static_cast<size_t>(index)];
+      continue;
+    }
+
+    return false;
+  }
+
+  valueOut = current;
+  return true;
+}
+
+void mqttInsertVariantAtPath(JsonObject root, const String &path, const JsonVariantConst &value) {
+  if (path.isEmpty()) {
+    mqttMergeCacheValue(root, value);
+    return;
+  }
+
+  String segments[20];
+  size_t count = 0;
+  mqttSplitTopicPath(path, segments, 20, count);
+  if (count == 0) {
+    mqttMergeCacheValue(root, value);
+    return;
+  }
+
+  JsonObject cursor = root;
+  for (size_t i = 0; i + 1 < count; ++i) {
+    JsonVariant child = cursor[segments[i]];
+    if (!child.is<JsonObject>()) {
+      cursor.remove(segments[i]);
+      cursor[segments[i]].to<JsonObject>();
+    }
+    cursor = cursor[segments[i]].as<JsonObject>();
+  }
+
+  mqttMergeCacheValue(cursor[segments[count - 1]], value);
+}
+
 bool mqttCacheFindPath(const String &topicPath, JsonVariantConst &valueOut) {
   if (!g_mqtt.cacheDoc.is<JsonObjectConst>()) return false;
 
@@ -1437,13 +1637,7 @@ void mqttMergeCacheValue(JsonVariant dst, const JsonVariantConst &src) {
 
 void mqttCacheStoreTopicPayload(const String &topic, const String &payload) {
   String normalizedTopic = normalizeTopicPath(topic);
-  if (normalizedTopic.endsWith("/data")) {
-    const String parentTopic = normalizedTopic.substring(0, normalizedTopic.length() - 5);
-    if (mqttIsTopicInList(g_cfg.mqttCacheTopics, parentTopic)) {
-      normalizedTopic = parentTopic;
-    }
-  }
-  if (!mqttIsTopicInList(g_cfg.mqttCacheTopics, normalizedTopic)) {
+  if (!mqttConfiguredListMatchesTopic(g_cfg.mqttCacheTopics, normalizedTopic)) {
     return;
   }
 
@@ -1453,12 +1647,6 @@ void mqttCacheStoreTopicPayload(const String &topic, const String &payload) {
   if (count == 0) return;
 
   String normalizedPayload = payload;
-  String ignoredN2o;
-  String ignoredH2o;
-  String ignoredDiag;
-  if (mqttPayloadLooksArray(normalizedPayload)) {
-    normalizedPayload = buildStructuredMqttPayload(normalizedPayload, ignoredN2o, ignoredH2o, ignoredDiag);
-  }
 
   JsonDocument payloadDoc;
   const DeserializationError payloadErr = deserializeJson(payloadDoc, normalizedPayload);
@@ -1541,19 +1729,14 @@ bool mqttBuildRawCacheView(const String &requestedTopic,
     if (!g_mqtt.raw[i].used) continue;
 
     const String canonicalTopic = mqttCanonicalTopic(g_mqtt.raw[i].topic, g_mqtt.raw[i].payload);
-    if (!mqttIsTopicInList(g_cfg.mqttCacheTopics, canonicalTopic)) continue;
-
-    const bool exact = mqttTopicEquals(requested, canonicalTopic);
-    const bool descendant = canonicalTopic.startsWith(requested + "/");
-    if (!exact && !descendant) continue;
-
-    found = true;
+    if (!mqttConfiguredListMatchesTopic(g_cfg.mqttCacheTopics, canonicalTopic)) continue;
     const String formattedPayload = mqttFormatPayloadForRead(g_mqtt.raw[i].topic, g_mqtt.raw[i].payload);
 
     JsonDocument payloadDoc;
     const DeserializationError payloadErr = deserializeJson(payloadDoc, formattedPayload);
 
-    if (exact) {
+    if (mqttTopicEquals(requested, canonicalTopic)) {
+      found = true;
       if (!payloadErr) {
         JsonVariantConst payloadVariant = payloadDoc.as<JsonVariantConst>();
         if (payloadVariant.is<JsonObjectConst>()) {
@@ -1569,27 +1752,49 @@ bool mqttBuildRawCacheView(const String &requestedTopic,
       continue;
     }
 
-    const String suffix = canonicalTopic.substring(requested.length() + 1);
-    String segments[20];
-    size_t count = 0;
-    mqttSplitTopicPath(suffix, segments, 20, count);
-    if (count == 0) continue;
+    String nestedSuffix;
+    if (mqttTryTopicSuffix(canonicalTopic, requested, nestedSuffix)) {
+      if (payloadErr) continue;
 
-    JsonObject cursor = root;
-    for (size_t seg = 0; seg + 1 < count; ++seg) {
-      JsonVariant child = cursor[segments[seg]];
-      if (!child.is<JsonObject>()) {
-        cursor.remove(segments[seg]);
-        cursor[segments[seg]].to<JsonObject>();
+      JsonVariantConst nestedValue;
+      if (!mqttJsonFindPath(payloadDoc.as<JsonVariantConst>(), nestedSuffix, nestedValue)) {
+        continue;
       }
-      cursor = cursor[segments[seg]].as<JsonObject>();
+
+      found = true;
+      if (nestedValue.is<JsonObjectConst>()) {
+        mqttMergeCacheValue(root, nestedValue);
+      } else {
+        hasScalarOut = true;
+        scalarOut = mqttValueToText(nestedValue, 720);
+      }
+      continue;
     }
 
-    const String leaf = segments[count - 1];
+    String descendantSuffix;
+    if (!mqttTryTopicSuffix(requested, canonicalTopic, descendantSuffix)) {
+      continue;
+    }
+
+    found = true;
     if (!payloadErr) {
-      mqttMergeCacheValue(cursor[leaf], payloadDoc.as<JsonVariantConst>());
+      mqttInsertVariantAtPath(root, descendantSuffix, payloadDoc.as<JsonVariantConst>());
     } else {
-      cursor[leaf] = sanitizeResponseValue(formattedPayload, 720);
+      String segments[20];
+      size_t count = 0;
+      mqttSplitTopicPath(descendantSuffix, segments, 20, count);
+      if (count == 0) continue;
+
+      JsonObject cursor = root;
+      for (size_t seg = 0; seg + 1 < count; ++seg) {
+        JsonVariant child = cursor[segments[seg]];
+        if (!child.is<JsonObject>()) {
+          cursor.remove(segments[seg]);
+          cursor[segments[seg]].to<JsonObject>();
+        }
+        cursor = cursor[segments[seg]].as<JsonObject>();
+      }
+      cursor[segments[count - 1]] = sanitizeResponseValue(formattedPayload, 720);
     }
   }
 
@@ -1880,17 +2085,12 @@ String mqttReadRawTopic(const String &topic) {
     return "@MQTT=ERR:NO_TOPIC_DATA!";
   }
 
-  JsonVariantConst value;
-  if (!mqttCacheFindPath(requestedTopic, value) ||
-      (value.is<JsonObjectConst>() && value.as<JsonObjectConst>().size() == 0)) {
-    const String dataPath = requestedTopic + "/data";
-    if (!mqttCacheFindPath(dataPath, value)) {
-      return "@MQTT=ERR:NO_TOPIC_DATA!";
-    }
+  String payload;
+  if (!mqttReadRawTopicFromCache(requestedTopic, payload)) {
+    return "@MQTT=ERR:NO_TOPIC_DATA!";
   }
 
-  const String json = mqttJsonLiteral(value, 720);
-  return "@MQTT=RX:TOPIC=" + sanitizeResponseValue(requestedTopic, 96) + ",NAME=" + sanitizeResponseValue(g_cfg.mqttName, 24) + ",JSON=" + sanitizeResponseValue(json, 720) + "!";
+  return "@MQTT=RX:TOPIC=" + sanitizeResponseValue(requestedTopic, 96) + ",NAME=" + sanitizeResponseValue(g_cfg.mqttName, 24) + ",JSON=" + sanitizeResponseValue(payload, 720) + "!";
 }
 
 String mqttReadCacheSummary() {
@@ -1908,6 +2108,16 @@ String mqttReadCacheSummary() {
 }
 
 String mqttReadPreferredSummary() {
+  String topics[16];
+  size_t count = 0;
+  if (parseTopicList(g_cfg.mqttTopics, topics, 16, count)) {
+    for (size_t i = 0; i < count; ++i) {
+      String payload;
+      if (mqttReadRawTopicFromCache(topics[i], payload)) {
+        return "@MQTT=RX:JSON=" + sanitizeResponseValue(payload, 720) + "!";
+      }
+    }
+  }
   return mqttReadCacheSummary();
 }
 
@@ -2121,21 +2331,40 @@ void mqttCallback(char *topic, uint8_t *payload, unsigned int length) {
   for (unsigned int i = 0; i < length; ++i) incomingPayload += static_cast<char>(payload[i]);
 
   const uint32_t sampleMs = millis();
-  const String canonicalTopic = mqttCanonicalTopic(incomingTopic, incomingPayload);
-  const bool cacheAllowed = mqttIsTopicInList(g_cfg.mqttCacheTopics, canonicalTopic) ||
-                            mqttIsTopicInList(g_cfg.mqttCacheTopics, incomingTopic);
-  if (cacheAllowed) {
-    mqttStoreRawSample(incomingTopic, incomingPayload, sampleMs);
-    mqttCacheStoreTopicPayload(incomingTopic, incomingPayload);
+  String cacheTopics[16];
+  String cachePayloads[16];
+  size_t cacheCount = 0;
+  mqttResolveConfiguredTopicPayloads(g_cfg.mqttCacheTopics,
+                                     incomingTopic,
+                                     incomingPayload,
+                                     cacheTopics,
+                                     cachePayloads,
+                                     16,
+                                     cacheCount);
+  for (size_t i = 0; i < cacheCount; ++i) {
+    mqttStoreRawSample(cacheTopics[i], cachePayloads[i], sampleMs);
+    mqttCacheStoreTopicPayload(cacheTopics[i], cachePayloads[i]);
   }
 
-  if (!mqttTopicAllowedForSummary(incomingTopic, incomingPayload)) {
+  String summaryTopics[16];
+  String summaryPayloads[16];
+  size_t summaryCount = 0;
+  mqttResolveConfiguredTopicPayloads(g_cfg.mqttTopics,
+                                     incomingTopic,
+                                     incomingPayload,
+                                     summaryTopics,
+                                     summaryPayloads,
+                                     16,
+                                     summaryCount);
+  if (summaryCount == 0) {
     return;
   }
 
-  g_mqtt.lastTopic = mqttCanonicalTopic(incomingTopic, incomingPayload);
-  g_mqtt.lastPayload = incomingPayload;
-  mqttCollectMessageFields(g_mqtt.lastTopic, g_mqtt.lastPayload);
+  g_mqtt.lastTopic = summaryTopics[0];
+  g_mqtt.lastPayload = summaryPayloads[0];
+  for (size_t i = 0; i < summaryCount; ++i) {
+    mqttCollectMessageFields(summaryTopics[i], summaryPayloads[i]);
+  }
   g_mqtt.lastRxMs = sampleMs;
   g_mqtt.lastRxLine = buildMqttRxLine();
 }
@@ -2155,6 +2384,7 @@ void ensureWifiAndMqtt() {
   }
   MqttClient.setServer(g_cfg.mqttUriHost.c_str(), g_cfg.mqttPort);
   MqttClient.setCallback(mqttCallback);
+  MqttClient.setBufferSize(kMqttClientBufferSize);
   if (!MqttClient.connected()) {
     static uint32_t lastMqttTry = 0;
     if (millis() - lastMqttTry > 3000) {
@@ -2163,24 +2393,8 @@ void ensureWifiAndMqtt() {
       if (MqttClient.connect(clientId.c_str())) {
         String topics[32];
         size_t count = 0;
-        parseTopicList(g_cfg.mqttTopics, topics, 16, count);
-
-        String cacheTopics[16];
-        size_t cacheCount = 0;
-        if (parseTopicList(g_cfg.mqttCacheTopics, cacheTopics, 16, cacheCount)) {
-          for (size_t i = 0; i < cacheCount && count < 32; ++i) {
-            bool duplicate = false;
-            for (size_t j = 0; j < count; ++j) {
-              if (normalizeTopicPath(topics[j]) == normalizeTopicPath(cacheTopics[i])) {
-                duplicate = true;
-                break;
-              }
-            }
-            if (!duplicate) {
-              topics[count++] = cacheTopics[i];
-            }
-          }
-        }
+        mqttAppendSubscriptionRoots(g_cfg.mqttTopics, topics, 32, count);
+        mqttAppendSubscriptionRoots(g_cfg.mqttCacheTopics, topics, 32, count);
 
         for (size_t i = 0; i < count; ++i) {
           MqttClient.subscribe(topics[i].c_str());
@@ -2420,23 +2634,7 @@ void handleCommand(const String &line) {
     sendLine("@I2C=BMP280#" + hexAddr(g_bmp280.addr) + ":TEMP_C=" + String(g_bmp280.tempC, 2) + ",PRESS_PA=" + String(g_bmp280.pressurePa, 1) + ",AGE_MS=" + formatAgeMs(g_bmp280.sampleMs) + "!");
   } else if (line == "@POLL=ALL!") {
     updateI2cSummary();
-    const bool mqttFresh = isFresh(g_mqtt.lastRxMs);
-    const bool gpsFresh = isFresh(g_gps.lastRxMs);
-    const bool shtOk = g_sht4x.valid && isFresh(g_sht4x.sampleMs);
-    const bool bmpOk = g_bmp280.valid && isFresh(g_bmp280.sampleMs);
-    const String shtAddrTag = hexAddr(shtOk ? g_sht4x.addr : 0);
-    const String bmpAddrTag = hexAddr(bmpOk ? g_bmp280.addr : 0);
-    sendLine("@POLL=ALL:MQTT_age_ms=" + (mqttFresh ? formatAgeMs(g_mqtt.lastRxMs) : String("-")) +
-             ",GPS_fix=" + String(gpsFresh && g_gps.fix ? 1 : 0) +
-             ",GPS_sats=" + (gpsFresh ? String(g_gps.sats) : String("-")) +
-             ",GPS_latitude=" + (gpsFresh && g_gps.fix ? String(g_gps.lat, 6) : String("-")) +
-             ",GPS_longitude=" + (gpsFresh && g_gps.fix ? String(g_gps.lon, 6) : String("-")) +
-             ",GPS_time=" + (gpsFresh && !g_gps.utcTime.isEmpty() ? g_gps.utcTime : String("-")) +
-             ",SHT4X_" + shtAddrTag + "_temp_c=" + (shtOk ? String(g_sht4x.tempC, 2) : String("-")) +
-             ",SHT4X_" + shtAddrTag + "_rh_pct=" + (shtOk ? String(g_sht4x.rhPct, 2) : String("-")) +
-             ",BMP280_" + bmpAddrTag + "_temp_c=" + (bmpOk ? String(g_bmp280.tempC, 2) : String("-")) +
-             ",BMP280_" + bmpAddrTag + "_press_pa=" + (bmpOk ? String(g_bmp280.pressurePa, 1) : String("-")) +
-             mqttPollFields() + "!");
+    sendLine("@POLL=ALL:" + buildPollAllFields() + "!");
   } else if (line == "@CFG=SAVE!") {
     saveConfig();
     sendLine("@CFG=OK:SAVED!");

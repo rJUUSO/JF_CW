@@ -1,22 +1,22 @@
 [wifi]
 join_enabled = 1
-ssid = "TG20-01489"
+ssid = "TG10-01250"
 password = "licorenv"
 
 [mqtt]
 enabled = 1
-name = "LI7820"
+name = "LI7810"
 uri = "192.168.10.1"
 port = 1883
-cache_topics = "licor/niobrara/output/concentration"
+cache_topics = "licor/niobrara/output/concentration/Concentration"
 
 [gps]
-enabled = 1
-baud = 9600
+enabled = 0
+baud = 115200
 
 [link]
 mode = "can"
-node_id = 33
+node_id = 10
 rs485_baud = 115200
 rs485_dir_gpio = -1
 can_bitrate = 500000
@@ -26,6 +26,6 @@ enabled = 0
 verbose = 0
 
 [logging]
-sht4x_addrs = "44"
-bmp280_addrs = "76"
-mqtt_topics = "licor/niobrara/output/concentration"
+sht4x_addrs = ""
+bmp280_addrs = ""
+mqtt_topics = "licor/niobrara/output/concentration/Concentration"

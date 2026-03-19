@@ -104,9 +104,10 @@ Poll-all workflow
 2. HUB forwards command to coworker.
 3. Coworker replies with one compact line containing:
 	- MQTT cache age
-	- GPS fix/satellite/location/time fields
-	- sensor readings keyed by sensor address (`SHT4X_<addr>_*`, `BMP280_<addr>_*`)
+	- GPS fix/satellite/location/time fields only when `[gps].enabled = 1`
+	- sensor readings keyed by sensor address (`SHT4X_<addr>_*`, `BMP280_<addr>_*`) only for addresses listed in `[logging]`
 	- dynamic MQTT payload-derived fields (for example `LI7820_<field>=...`)
+	- keyed MQTT arrays are flattened to their primary value, so a payload field like `H2O:[40.1,1]` becomes `LI7810_h2o=40.1`
 
 Extensibility
 
