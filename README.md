@@ -49,7 +49,12 @@ Pin plan
     - local I2C sensor bus for SHT4X and BMP280
 - AtomS3 Port.C:
     - `TX=G5`, `RX=G6`
-    - GPS/BDS UART
+    - GPS/BDS UART (default `[gps] rx_gpio = 6`, `tx_gpio = 5`)
+- Atomic GPS Base under the AtomS3 (AT6558, 9600 baud): the GPS data arrives on `G5`
+    - `[gps] baud = 9600`, `rx_gpio = 5`, `tx_gpio = 6`
+    - or live: `@CFG=SET:gps.rx_gpio=5!`, `@CFG=SET:gps.tx_gpio=6!`, `@CFG=SET:gps.baud=9600!`, `@CFG=SAVE!`
+    - `@GPS=RAW!` `AGE_MS` is the age of the last NMEA sentence, `-1` = none yet (wrong pin or baud);
+      the module sends sentences without a fix too
 
 Build
 
@@ -146,7 +151,7 @@ Main config groups
 
 - `[wifi]`
 - `[mqtt]`
-- `[gps]`
+- `[gps]` (`enabled`, `baud`, `rx_gpio`, `tx_gpio`; a `gps.*` change restarts the GPS UART)
 - `[link]`
 - `[debug]`
 - `[logging]`

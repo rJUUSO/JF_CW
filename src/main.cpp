@@ -53,6 +53,9 @@ struct CoworkerConfig {
   String mqttTopics = "licor/niobrara/output/concentration";
   bool gpsEnabled = true;
   uint32_t gpsBaud = 9600;
+  // Port.C GPS unit: RX G6 / TX G5. Atomic GPS Base under an AtomS3: RX G5 / TX G6.
+  int gpsRxGpio = kGpsRx;
+  int gpsTxGpio = kGpsTx;
   LinkMode linkMode = LinkMode::RS485;
   uint8_t nodeId = 33;
   uint8_t hubNodeId = 17;
@@ -2138,7 +2141,9 @@ void saveConfig() {
   f.printf("cache_topics = \"%s\"\n\n", tomlEscape(g_cfg.mqttCacheTopics).c_str());
   f.println("[gps]");
   f.printf("enabled = %d\n", g_cfg.gpsEnabled ? 1 : 0);
-  f.printf("baud = %lu\n\n", static_cast<unsigned long>(g_cfg.gpsBaud));
+  f.printf("baud = %lu\n", static_cast<unsigned long>(g_cfg.gpsBaud));
+  f.printf("rx_gpio = %d\n", g_cfg.gpsRxGpio);
+  f.printf("tx_gpio = %d\n\n", g_cfg.gpsTxGpio);
   f.println("[link]");
   f.printf("mode = \"%s\"\n", modeToString(g_cfg.linkMode).c_str());
   f.printf("node_id = %u\n", g_cfg.nodeId);
@@ -2169,6 +2174,8 @@ void applyKeyValue(const String &section, const String &key, const String &value
   } else if (section == "gps") {
     if (key == "enabled") g_cfg.gpsEnabled = parseTomlBool(value);
     else if (key == "baud") g_cfg.gpsBaud = static_cast<uint32_t>(value.toInt());
+    else if (key == "rx_gpio") g_cfg.gpsRxGpio = value.toInt();
+    else if (key == "tx_gpio") g_cfg.gpsTxGpio = value.toInt();
   } else if (section == "link") {
     if (key == "mode") g_cfg.linkMode = parseMode(value);
     else if (key == "node_id") g_cfg.nodeId = static_cast<uint8_t>(value.toInt());
@@ -2500,6 +2507,8 @@ String getConfigValue(const String &name) {
   if (name == "mqtt.cache_topics") return g_cfg.mqttCacheTopics;
   if (name == "gps.enabled") return String(g_cfg.gpsEnabled ? 1 : 0);
   if (name == "gps.baud") return String(g_cfg.gpsBaud);
+  if (name == "gps.rx_gpio") return String(g_cfg.gpsRxGpio);
+  if (name == "gps.tx_gpio") return String(g_cfg.gpsTxGpio);
   if (name == "link.mode") return modeToString(g_cfg.linkMode);
   if (name == "link.node_id") return String(g_cfg.nodeId);
   if (name == "link.rs485_baud") return String(g_cfg.rs485Baud);
@@ -2524,6 +2533,8 @@ bool setConfigValue(const String &name, const String &value) {
   else if (name == "mqtt.cache_topics") g_cfg.mqttCacheTopics = parseConfigStringValue(value);
   else if (name == "gps.enabled") g_cfg.gpsEnabled = parseTomlBool(value);
   else if (name == "gps.baud") g_cfg.gpsBaud = static_cast<uint32_t>(value.toInt());
+  else if (name == "gps.rx_gpio") g_cfg.gpsRxGpio = value.toInt();
+  else if (name == "gps.tx_gpio") g_cfg.gpsTxGpio = value.toInt();
   else if (name == "link.mode") g_cfg.linkMode = parseMode(parseConfigStringValue(value));
   else if (name == "link.node_id") g_cfg.nodeId = static_cast<uint8_t>(value.toInt());
   else if (name == "link.rs485_baud") g_cfg.rs485Baud = static_cast<uint32_t>(value.toInt());
@@ -2536,6 +2547,15 @@ bool setConfigValue(const String &name, const String &value) {
   else if (name == "logging.mqtt_topics") g_cfg.mqttTopics = parseConfigStringValue(value);
   else return false;
   return true;
+}
+
+// GPS UART with the configured baud and pins; called at boot and when a gps.* setting changes.
+void beginGps() {
+  GpsSerial.end();
+  g_gps.fix = false;
+  g_gps.sats = 0;
+  g_gps.lastRxMs = 0;
+  GpsSerial.begin(g_cfg.gpsBaud, SERIAL_8N1, g_cfg.gpsRxGpio, g_cfg.gpsTxGpio);
 }
 
 void handleCommand(const String &line) {
@@ -2641,6 +2661,7 @@ void handleCommand(const String &line) {
   } else if (line == "@CFG=RELOAD!") {
     loadConfig();
     beginLink();
+    beginGps();
     sendLine("@CFG=OK:RELOADED!");
   } else if (line == "@DBG=ENABLE!") {
     g_cfg.debugEnabled = true;
@@ -2666,6 +2687,7 @@ void handleCommand(const String &line) {
       return;
     }
     if (key.startsWith("link.")) beginLink();
+    if (key.startsWith("gps.")) beginGps();
     sendLine("@CFG=OK:" + key + "=" + value + "!");
   } else {
     sendLine("@ERR=UNKNOWN!");
@@ -2775,7 +2797,7 @@ void setup() {
     Serial.println("@SYS=ERR:LITTLEFS!");
   }
   loadConfig();
-  GpsSerial.begin(g_cfg.gpsBaud, SERIAL_8N1, kGpsRx, kGpsTx);
+  beginGps();
   beginLink();
   refreshSensorCaches(true);
   updateI2cSummary();
