@@ -7,6 +7,8 @@
 #include <TinyGPSPlus.h>
 #include <M5Unified.h>
 #include <driver/twai.h>
+#include <lwip/sockets.h>
+#include <sys/time.h>
 
 #include "coworker_protocol.h"
 
@@ -45,6 +47,12 @@ struct CoworkerConfig {
   bool wifiJoinEnabled = true;
   String wifiSsid = "TG10-01250";
   String wifiPassword = "licorenv";
+  // Fixed address on the analyzer's Wi-Fi (an analyzer's NTP setting needs one); empty = DHCP.
+  String wifiIp = "";
+  String wifiMask = "255.255.255.0";
+  String wifiGateway = "";  // empty = <ip>.1 (the analyzer)
+  String wifiDns = "";      // empty = the gateway
+  bool ntpEnabled = true;   // NTP server on UDP 123 with the host's time (@TIME=SET)
   bool mqttEnabled = true;
   String mqttName = "LI7820";
   String mqttUriHost = "192.168.10.1";
@@ -462,6 +470,163 @@ String sanitizeMqttKey(const String &input, size_t maxLen = kMqttKeyLen - 1) {
 
 bool isFresh(uint32_t timestampMs, uint32_t maxAgeMs = kCacheFreshMs) {
   return timestampMs != 0 && millis() - timestampMs <= maxAgeMs;
+}
+
+// ---- time from the host (@TIME=SET) and the NTP server
+
+void sendLine(const String &line, ReplyChannel channel);  // (the default argument comes later)
+void reply(const String &line) { sendLine(line, ReplyChannel::Response); }
+
+volatile bool g_timeSynced = false;
+volatile int g_timeStratum = 16;        // the host clock's stratum; ours is one more
+volatile uint32_t g_timeDispUs = 0;     // the host clock's root dispersion
+volatile uint32_t g_timeSyncMs = 0;     // millis() of the last @TIME=SET
+volatile uint32_t g_ntpRequests = 0, g_ntpAnswered = 0;
+volatile uint32_t g_ntpLastClient = 0;  // network order
+volatile bool g_ntpRunning = false;
+constexpr int64_t kNtpEpochOffset = 2208988800LL;  // 1900 -> 1970
+constexpr int64_t kPlausibleUs = 1704067200LL * 1000000;  // 2024-01-01
+
+int64_t nowUs() {
+  timeval tv;
+  gettimeofday(&tv, nullptr);
+  return static_cast<int64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
+}
+
+void putNtpTime(uint8_t *p, int64_t us) {
+  const int64_t sec = us / 1000000 + kNtpEpochOffset;
+  const uint64_t frac = (static_cast<uint64_t>(us % 1000000) << 32) / 1000000;
+  for (int i = 0; i < 4; i++) p[i] = static_cast<uint8_t>(sec >> (24 - 8 * i));
+  for (int i = 0; i < 4; i++) p[4 + i] = static_cast<uint8_t>(frac >> (24 - 8 * i));
+}
+
+int servedStratum() {
+  if (!g_timeSynced || nowUs() < kPlausibleUs) return 16;
+  const int s = g_timeStratum + 1;
+  return s > 15 ? 16 : s;
+}
+
+// The answer (mode 4) to a client request (mode 3), as the cyberdeck's NTP server does.
+bool buildNtpReply(const uint8_t *req, int n, int64_t rxUs, uint8_t *out) {
+  if (n < 48 || (req[0] & 7) != 3) return false;
+  int version = (req[0] >> 3) & 7;
+  if (version < 1 || version > 4) version = 4;
+  const int stratum = servedStratum();
+  memset(out, 0, 48);
+  out[0] = static_cast<uint8_t>((stratum >= 16 ? 3 : 0) << 6 | version << 3 | 4);
+  out[1] = static_cast<uint8_t>(stratum >= 16 ? 0 : stratum);
+  out[2] = req[2];
+  out[3] = static_cast<uint8_t>(static_cast<int8_t>(-10));
+  // Root dispersion: the host's, the serial link (10 ms), 15 ppm since the last set.
+  const uint32_t ageS = (millis() - g_timeSyncMs) / 1000;
+  const uint64_t dispUs = static_cast<uint64_t>(g_timeDispUs) + 10000 + static_cast<uint64_t>(ageS) * 15;
+  const uint32_t disp = static_cast<uint32_t>((dispUs << 16) / 1000000);
+  for (int i = 0; i < 4; i++) out[8 + i] = static_cast<uint8_t>(disp >> (24 - 8 * i));
+  memcpy(out + 12, "LINK", 4);  // the time comes over the serial link
+  if (g_timeSyncMs) putNtpTime(out + 16, nowUs() - static_cast<int64_t>(millis() - g_timeSyncMs) * 1000);
+  memcpy(out + 24, req + 40, 8);  // originate = the client's transmit time
+  putNtpTime(out + 32, rxUs);
+  putNtpTime(out + 40, nowUs());
+  return true;
+}
+
+// Its own task: recvfrom() blocks, so a request is time-stamped as it arrives.
+void ntpTask(void *) {
+  int sock = -1;
+  for (;;) {
+    if (!g_cfg.ntpEnabled || WiFi.status() != WL_CONNECTED) {
+      if (sock >= 0) {
+        close(sock);
+        sock = -1;
+        g_ntpRunning = false;
+      }
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+    if (sock < 0) {
+      sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+      sockaddr_in a = {};
+      a.sin_family = AF_INET;
+      a.sin_port = htons(123);
+      a.sin_addr.s_addr = htonl(INADDR_ANY);
+      if (sock < 0 || bind(sock, reinterpret_cast<sockaddr *>(&a), sizeof(a)) < 0) {
+        if (sock >= 0) close(sock);
+        sock = -1;
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        continue;
+      }
+      timeval tv = {1, 0};
+      setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      g_ntpRunning = true;
+    }
+    uint8_t req[96];
+    sockaddr_in from = {};
+    socklen_t fl = sizeof(from);
+    const int n = recvfrom(sock, req, sizeof(req), 0, reinterpret_cast<sockaddr *>(&from), &fl);
+    if (n <= 0) continue;
+    const int64_t rx = nowUs();
+    g_ntpRequests++;
+    uint8_t out[48];
+    if (!buildNtpReply(req, n, rx, out)) continue;
+    if (sendto(sock, out, sizeof(out), 0, reinterpret_cast<sockaddr *>(&from), fl) == static_cast<int>(sizeof(out))) g_ntpAnswered++;
+    g_ntpLastClient = from.sin_addr.s_addr;
+  }
+}
+
+String ipText(uint32_t netOrder) {
+  return IPAddress(netOrder).toString();
+}
+
+// @TIME=SET:<unix_ms>[,<stratum>[,<dispersion_us>]]! from the host. The line took
+// a few ms over the wire and up to a loop pass (10 ms) to be read: half a pass is added.
+void handleTimeSet(const String &args) {
+  const int64_t ms = strtoll(args.c_str(), nullptr, 10);
+  if (ms * 1000 < kPlausibleUs) {
+    reply("@TIME=ERR:VALUE!");
+    return;
+  }
+  int stratum = 1;
+  uint32_t dispUs = 0;
+  const int c1 = args.indexOf(',');
+  if (c1 > 0) {
+    stratum = args.substring(c1 + 1).toInt();
+    const int c2 = args.indexOf(',', c1 + 1);
+    if (c2 > 0) dispUs = static_cast<uint32_t>(strtoul(args.substring(c2 + 1).c_str(), nullptr, 10));
+  }
+  const int64_t us = ms * 1000 + 5000;
+  timeval tv = {static_cast<time_t>(us / 1000000), static_cast<suseconds_t>(us % 1000000)};
+  settimeofday(&tv, nullptr);
+  g_timeStratum = stratum < 1 ? 1 : stratum;
+  g_timeDispUs = dispUs;
+  g_timeSyncMs = millis();
+  g_timeSynced = stratum < 16;
+  reply("@TIME=OK:" + String(static_cast<long long>(nowUs() / 1000)) + "!");
+}
+
+void sendTimeNow() {
+  const uint32_t age = g_timeSyncMs ? (millis() - g_timeSyncMs) / 1000 : 0;
+  reply("@TIME=NOW:" + String(static_cast<long long>(nowUs() / 1000)) + ",SYNCED=" + String(g_timeSynced ? 1 : 0) +
+           ",STRATUM=" + String(servedStratum()) + ",AGE_S=" + String(age) + "!");
+}
+
+void sendNtpStatus() {
+  reply("@NTP=STATUS:EN=" + String(g_cfg.ntpEnabled ? 1 : 0) + ",RUNNING=" + String(g_ntpRunning ? 1 : 0) +
+           ",SYNCED=" + String(g_timeSynced ? 1 : 0) + ",STRATUM=" + String(servedStratum()) +
+           ",REQ=" + String(g_ntpRequests) + ",ANS=" + String(g_ntpAnswered) +
+           ",LAST=" + (g_ntpLastClient ? ipText(g_ntpLastClient) : String("-")) +
+           ",IP=" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("-")) + "!");
+}
+
+// The LI-COR topics' root ("licor/niobrara/"), from the configured data topic.
+String licorTopicRoot() {
+  String topics[4];
+  size_t count = 0;
+  splitCsv(g_cfg.mqttTopics, topics, 4, count);
+  for (size_t i = 0; i < count; i++) {
+    const int at = topics[i].indexOf("/output/");
+    if (at > 0) return topics[i].substring(0, at + 1);
+  }
+  return "licor/niobrara/";
 }
 
 String hexAddr(uint8_t addr) {
@@ -2132,7 +2297,13 @@ void saveConfig() {
   f.println("[wifi]");
   f.printf("join_enabled = %d\n", g_cfg.wifiJoinEnabled ? 1 : 0);
   f.printf("ssid = \"%s\"\n", tomlEscape(g_cfg.wifiSsid).c_str());
-  f.printf("password = \"%s\"\n\n", tomlEscape(g_cfg.wifiPassword).c_str());
+  f.printf("password = \"%s\"\n", tomlEscape(g_cfg.wifiPassword).c_str());
+  f.printf("ip = \"%s\"\n", tomlEscape(g_cfg.wifiIp).c_str());
+  f.printf("mask = \"%s\"\n", tomlEscape(g_cfg.wifiMask).c_str());
+  f.printf("gateway = \"%s\"\n", tomlEscape(g_cfg.wifiGateway).c_str());
+  f.printf("dns = \"%s\"\n\n", tomlEscape(g_cfg.wifiDns).c_str());
+  f.println("[ntp]");
+  f.printf("enabled = %d\n\n", g_cfg.ntpEnabled ? 1 : 0);
   f.println("[mqtt]");
   f.printf("enabled = %d\n", g_cfg.mqttEnabled ? 1 : 0);
   f.printf("name = \"%s\"\n", tomlEscape(g_cfg.mqttName).c_str());
@@ -2165,6 +2336,12 @@ void applyKeyValue(const String &section, const String &key, const String &value
     if (key == "join_enabled") g_cfg.wifiJoinEnabled = parseTomlBool(value);
     else if (key == "ssid") g_cfg.wifiSsid = value;
     else if (key == "password") g_cfg.wifiPassword = value;
+    else if (key == "ip") g_cfg.wifiIp = value;
+    else if (key == "mask") g_cfg.wifiMask = value;
+    else if (key == "gateway") g_cfg.wifiGateway = value;
+    else if (key == "dns") g_cfg.wifiDns = value;
+  } else if (section == "ntp") {
+    if (key == "enabled") g_cfg.ntpEnabled = parseTomlBool(value);
   } else if (section == "mqtt") {
     if (key == "enabled") g_cfg.mqttEnabled = parseTomlBool(value);
     else if (key == "name") g_cfg.mqttName = value;
@@ -2376,12 +2553,35 @@ void mqttCallback(char *topic, uint8_t *payload, unsigned int length) {
   g_mqtt.lastRxLine = buildMqttRxLine();
 }
 
+uint32_t g_lastWifiTry = 0;
+
+// wifi.ip set: that address (gateway <ip>.1 unless set, DNS = gateway); else DHCP.
+void applyWifiAddress() {
+  IPAddress ip, mask, gw, dns;
+  if (!g_cfg.wifiIp.isEmpty() && ip.fromString(g_cfg.wifiIp)) {
+    if (!mask.fromString(g_cfg.wifiMask)) mask = IPAddress(255, 255, 255, 0);
+    if (!gw.fromString(g_cfg.wifiGateway)) gw = IPAddress(ip[0], ip[1], ip[2], 1);
+    if (!dns.fromString(g_cfg.wifiDns)) dns = gw;
+    WiFi.config(ip, gw, mask, dns);
+  } else {
+    // DHCP: 0.0.0.0 (not INADDR_NONE, which lwIP's headers make 255.255.255.255).
+    const IPAddress none(static_cast<uint32_t>(0));
+    WiFi.config(none, none, none);
+  }
+}
+
+// A wifi.* setting changed: join again with it.
+void wifiRejoin() {
+  WiFi.disconnect(false);
+  g_lastWifiTry = 0;
+}
+
 void ensureWifiAndMqtt() {
   if (g_cfg.wifiJoinEnabled && WiFi.status() != WL_CONNECTED) {
-    static uint32_t lastWifiTry = 0;
-    if (millis() - lastWifiTry > 5000) {
-      lastWifiTry = millis();
+    if (g_lastWifiTry == 0 || millis() - g_lastWifiTry > 5000) {
+      g_lastWifiTry = millis() | 1;
       WiFi.mode(WIFI_STA);
+      applyWifiAddress();
       WiFi.begin(g_cfg.wifiSsid.c_str(), g_cfg.wifiPassword.c_str());
     }
   }
@@ -2496,7 +2696,27 @@ void reportStateTransitions() {
   }
 }
 
+bool getConfigValue(const String &name, String &out);
+String getConfigValueOld(const String &name);
+
 String getConfigValue(const String &name) {
+  String v;
+  getConfigValue(name, v);
+  return v;
+}
+
+// false for an unknown key (an empty value is a value: wifi.ip empty = DHCP).
+bool getConfigValue(const String &name, String &out) {
+  if (name == "wifi.ip") return out = g_cfg.wifiIp, true;
+  if (name == "wifi.mask") return out = g_cfg.wifiMask, true;
+  if (name == "wifi.gateway") return out = g_cfg.wifiGateway, true;
+  if (name == "wifi.dns") return out = g_cfg.wifiDns, true;
+  if (name == "ntp.enabled") return out = String(g_cfg.ntpEnabled ? 1 : 0), true;
+  out = getConfigValueOld(name);
+  return !out.isEmpty();
+}
+
+String getConfigValueOld(const String &name) {
   if (name == "wifi.join_enabled") return String(g_cfg.wifiJoinEnabled ? 1 : 0);
   if (name == "wifi.ssid") return g_cfg.wifiSsid;
   if (name == "wifi.password") return g_cfg.wifiPassword;
@@ -2523,7 +2743,12 @@ String getConfigValue(const String &name) {
 }
 
 bool setConfigValue(const String &name, const String &value) {
-  if (name == "wifi.join_enabled") g_cfg.wifiJoinEnabled = parseTomlBool(value);
+  if (name == "wifi.ip") g_cfg.wifiIp = parseConfigStringValue(value);
+  else if (name == "wifi.mask") g_cfg.wifiMask = parseConfigStringValue(value);
+  else if (name == "wifi.gateway") g_cfg.wifiGateway = parseConfigStringValue(value);
+  else if (name == "wifi.dns") g_cfg.wifiDns = parseConfigStringValue(value);
+  else if (name == "ntp.enabled") g_cfg.ntpEnabled = parseTomlBool(value);
+  else if (name == "wifi.join_enabled") g_cfg.wifiJoinEnabled = parseTomlBool(value);
   else if (name == "wifi.ssid") g_cfg.wifiSsid = parseConfigStringValue(value);
   else if (name == "wifi.password") g_cfg.wifiPassword = parseConfigStringValue(value);
   else if (name == "mqtt.enabled") g_cfg.mqttEnabled = parseTomlBool(value);
@@ -2613,7 +2838,49 @@ void handleCommand(const String &line) {
   } else if (line == "@LINK=ADDR!") {
     sendLine("@LINK=ADDR:" + String(g_cfg.nodeId) + "!");
   } else if (line == "@WIFI=STATUS!") {
-    sendLine("@WIFI=STATUS:JOIN=" + String(g_cfg.wifiJoinEnabled ? 1 : 0) + ",CONNECTED=" + String(WiFi.status() == WL_CONNECTED ? 1 : 0) + ",SSID=" + g_cfg.wifiSsid + "!");
+    const bool up = WiFi.status() == WL_CONNECTED;
+    sendLine("@WIFI=STATUS:JOIN=" + String(g_cfg.wifiJoinEnabled ? 1 : 0) + ",CONNECTED=" + String(up ? 1 : 0) + ",SSID=" + g_cfg.wifiSsid +
+             ",IP=" + (up ? WiFi.localIP().toString() : String("-")) + ",ADDR=" + (g_cfg.wifiIp.isEmpty() ? String("dhcp") : String("fixed")) + "!");
+  } else if (line.startsWith("@TIME=SET:") && line.endsWith("!")) {
+    handleTimeSet(line.substring(10, line.length() - 1));
+  } else if (line == "@TIME=GET!") {
+    sendTimeNow();
+  } else if (line == "@NTP=STATUS!") {
+    sendNtpStatus();
+  } else if ((line == "@NTP=LICOR!" || line.startsWith("@NTP=LICOR:")) && line.endsWith("!")) {
+    // The analyzer this coworker reads takes its time from this coworker's NTP server.
+    String tz = line.length() > 12 ? line.substring(11, line.length() - 1) : String("Etc/UTC");
+    tz.trim();
+    if (tz.isEmpty()) tz = "Etc/UTC";
+    if (WiFi.status() != WL_CONNECTED || !MqttClient.connected()) {
+      sendLine("@NTP=ERR:MQTT!");
+      return;
+    }
+    if (!g_cfg.ntpEnabled) {
+      sendLine("@NTP=ERR:DISABLED!");
+      return;
+    }
+    const String ip = WiFi.localIP().toString();
+    const String topic = licorTopicRoot() + "info/obtain_time_by";
+    const String payload = "[\"auto\",\"ntp\",\"" + ip + "\",\"" + tz + "\"]";
+    sendLine(MqttClient.publish(topic.c_str(), payload.c_str(), false) ? "@NTP=OK:LICOR," + ip + "," + tz + "!" : String("@NTP=ERR:PUBLISH!"));
+  } else if (line.startsWith("@MQTT=PUB:") && line.endsWith("!")) {
+    // @MQTT=PUB:<retain 0|1>,<topic>,<payload>! to the analyzer's broker.
+    const String body = line.substring(10, line.length() - 1);
+    const int c1 = body.indexOf(',');
+    const int c2 = c1 > 0 ? body.indexOf(',', c1 + 1) : -1;
+    if (c1 <= 0 || c2 <= c1 + 1) {
+      sendLine("@MQTT=ERR:FORMAT!");
+      return;
+    }
+    if (!MqttClient.connected()) {
+      sendLine("@MQTT=ERR:NOT_CONNECTED!");
+      return;
+    }
+    const bool retain = body.substring(0, c1).toInt() != 0;
+    const String topic = body.substring(c1 + 1, c2);
+    const String payload = body.substring(c2 + 1);
+    sendLine(MqttClient.publish(topic.c_str(), payload.c_str(), retain) ? "@MQTT=OK:PUB," + topic + "!" : String("@MQTT=ERR:PUBLISH!"));
   } else if (line == "@MQTT=STATUS!") {
     sendLine("@MQTT=STATUS:EN=" + String(g_cfg.mqttEnabled ? 1 : 0) + ",CONNECTED=" + String(g_mqtt.connected ? 1 : 0) + ",TOPIC=" + (g_mqtt.lastTopic.isEmpty() ? String("-") : g_mqtt.lastTopic) + "!");
   } else if (line == "@MQTT=LAST!") {
@@ -2671,8 +2938,8 @@ void handleCommand(const String &line) {
     sendLine("@DBG=OK:DISABLED!");
   } else if (line.startsWith("@CFG=GET:")) {
     const String key = line.substring(9, line.length() - 1);
-    const String value = getConfigValue(key);
-    sendLine(value.isEmpty() ? "@CFG=ERR:UNKNOWN!" : "@CFG=" + key + "=" + value + "!");
+    String value;
+    sendLine(!getConfigValue(key, value) ? "@CFG=ERR:UNKNOWN!" : "@CFG=" + key + "=" + value + "!");
   } else if (line.startsWith("@CFG=SET:")) {
     const String body = line.substring(9, line.length() - 1);
     const int eq = body.indexOf('=');
@@ -2688,6 +2955,7 @@ void handleCommand(const String &line) {
     }
     if (key.startsWith("link.")) beginLink();
     if (key.startsWith("gps.")) beginGps();
+    if (key.startsWith("wifi.")) wifiRejoin();
     sendLine("@CFG=OK:" + key + "=" + value + "!");
   } else {
     sendLine("@ERR=UNKNOWN!");
@@ -2799,6 +3067,7 @@ void setup() {
   loadConfig();
   beginGps();
   beginLink();
+  xTaskCreatePinnedToCore(ntpTask, "ntp", 4096, nullptr, 2, nullptr, 0);
   refreshSensorCaches(true);
   updateI2cSummary();
   sendLine("@BOOT=OK:JUUSOFLUX_COWORKER!");

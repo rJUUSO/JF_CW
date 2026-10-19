@@ -25,6 +25,9 @@ Current status
 - MQTT raw/cache ingestion and JSON read views are implemented
 - SHT4X and BMP280 reads are implemented with background cache refresh
 - remote `@CFG=GET/SET/SAVE/RELOAD` is implemented
+- a fixed Wi-Fi address (`[wifi] ip / mask / gateway / dns`, empty `ip` = DHCP)
+- time from the host (`@TIME=SET`) and an NTP server with it (`[ntp] enabled`), so the analyzer can
+  take its time from the coworker (`@NTP=LICOR!`); see protocol.md "Time and NTP server"
 
 Not yet completed
 

@@ -34,12 +34,33 @@ Implemented command groups
 - system: `@SYS=HELLO!`
 - CAN: `@CAN=STATUS!`, `@CAN=REINIT!`, `@CAN=TXTEST!`
 - link: `@LINK=STATUS!`, `@LINK=ADDR!`
-- Wi-Fi/MQTT: `@WIFI=STATUS!`, `@MQTT=STATUS!`, `@MQTT=LAST!`, `@MQTT=READ!`, `@MQTT=READ:<topic>!`
+- Wi-Fi/MQTT: `@WIFI=STATUS!`, `@MQTT=STATUS!`, `@MQTT=LAST!`, `@MQTT=READ!`, `@MQTT=READ:<topic>!`,
+  `@MQTT=PUB:<retain 0|1>,<topic>,<payload>!`
+- time / NTP: `@TIME=SET:<unix_ms>[,<stratum>[,<dispersion_us>]]!`, `@TIME=GET!`, `@NTP=STATUS!`,
+  `@NTP=LICOR[:<tz>]!`
 - GPS: `@GPS=STATUS!`, `@GPS=RAW!`
 - I2C: `@I2C=SCAN!`, `@I2C=LIST!`, `@I2C=SHT4X:READ!`, `@I2C=BMP280:READ!`
 - aggregate: `@POLL=ALL!`
 - config: `@CFG=GET:<key>!`, `@CFG=SET:<key>=<value>!`, `@CFG=SAVE!`, `@CFG=RELOAD!`
 - debug: `@DBG=ENABLE!`, `@DBG=DISABLE!`
+
+Time and NTP server
+
+- the coworker has no clock of its own: the host sends `@TIME=SET:<unix_ms>,<stratum>,<dispersion_us>!`
+  (ESP_CYBERDECK's JuusoFlux after a poll every 2 minutes, stamped for when the line has gone out);
+  the coworker adds half a loop pass (5 ms) and answers `@TIME=OK:<its unix_ms>!`
+- `[ntp] enabled = 1`: an NTP server on UDP 123 of its Wi-Fi interface, in its own task (requests
+  time-stamped as they arrive); stratum = the host's + 1, reference id `LINK`, root dispersion =
+  the host's + 10 ms + 15 ppm of the time since the last set; "not synchronised" (leap 3) until a set
+- `@TIME=GET!` -> `@TIME=NOW:<unix_ms>,SYNCED=1,STRATUM=11,AGE_S=34!`
+- `@NTP=STATUS!` -> `@NTP=STATUS:EN=1,RUNNING=1,SYNCED=1,STRATUM=11,REQ=1,ANS=1,LAST=192.168.10.171,IP=192.168.10.61!`
+- `@NTP=LICOR[:<tz>]!`: the analyzer this coworker reads takes its time from the coworker:
+  publishes `<root>info/obtain_time_by` = `["auto","ntp","<coworker ip>","<tz, default Etc/UTC>"]`
+  (root from `logging.mqtt_topics`, e.g. `licor/niobrara/`) -> `@NTP=OK:LICOR,<ip>,<tz>!`
+- the analyzer's NTP setting is an address: give the coworker a fixed one first:
+  `[wifi] ip`, `mask` (default /24), `gateway` (empty = `<ip>.1`, the analyzer), `dns` (empty = the
+  gateway); empty `ip` = DHCP. `@CFG=SET:wifi.*` joins again at once; `@WIFI=STATUS!` shows
+  `IP=` and `ADDR=dhcp|fixed`
 
 MQTT read behavior
 
