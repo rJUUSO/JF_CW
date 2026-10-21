@@ -182,6 +182,9 @@ bool g_prevWifiConnected = false;
 bool g_prevMqttConnected = false;
 bool g_prevGpsFix = false;
 uint32_t g_lastSensorRefreshMs = 0;
+// The analyzer's battery from its retained <root>system/Battery and system/AC (-1 = not heard).
+int g_licorBattery = -1;
+int g_licorAc = -1;
 Sht4xCache g_sht4x;
 Bmp280Cache g_bmp280;
 CommandSource g_commandSource = CommandSource::Local;
@@ -687,14 +690,20 @@ void appendBmp280PollFields(String &out) {
   }
 }
 
+String mqttNamePrefix();
+
 String buildPollAllFields() {
   String out;
   const bool mqttFresh = isFresh(g_mqtt.lastRxMs);
   appendPollField(out, "MQTT_age_ms", mqttFresh ? formatAgeMs(g_mqtt.lastRxMs) : String("-"));
+  // The Wi-Fi signal to the analyzer's access point (dBm).
+  appendPollField(out, "WIFI_rssi", WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String("-"));
   appendGpsPollFields(out);
   appendSht4xPollFields(out);
   appendBmp280PollFields(out);
   out += mqttPollFields();
+  if (mqttFresh && g_licorBattery >= 0) appendPollField(out, mqttNamePrefix() + "_battery", String(g_licorBattery));
+  if (mqttFresh && g_licorAc >= 0) appendPollField(out, mqttNamePrefix() + "_ac", String(g_licorAc));
   return out;
 }
 
@@ -808,6 +817,16 @@ String mqttRelativeTopicPath(const String &topic) {
 String mqttNamePrefix() {
   const String key = sanitizeMqttKey(g_cfg.mqttName, 23);
   return key.isEmpty() ? String("LI7820") : key;
+}
+
+// The analyzer's topic root from the first MQTT topic: "licor/niobrara/output/..." -> "licor/niobrara/".
+String licorRootTopic() {
+  String topics[4];
+  size_t count = 0;
+  splitCsv(g_cfg.mqttTopics, topics, 4, count);
+  const String t = count ? trimCopy(topics[0]) : String("licor/niobrara/output/concentration");
+  const int o = t.indexOf("/output/");
+  return o >= 0 ? t.substring(0, o + 1) : String("licor/niobrara/");
 }
 
 bool mqttIsTopicInList(const String &listCsv, const String &topic);
@@ -2514,6 +2533,15 @@ void mqttCallback(char *topic, uint8_t *payload, unsigned int length) {
   incomingPayload.reserve(length);
   for (unsigned int i = 0; i < length; ++i) incomingPayload += static_cast<char>(payload[i]);
 
+  // The battery topics are kept apart from the configured topics and their cache.
+  const String root = licorRootTopic();
+  if (incomingTopic == root + "system/Battery" || incomingTopic == root + "system/AC") {
+    String v = incomingPayload;
+    v.replace("\"", "");
+    (incomingTopic.endsWith("/AC") ? g_licorAc : g_licorBattery) = v.toInt();
+    return;
+  }
+
   const uint32_t sampleMs = millis();
   String cacheTopics[16];
   String cachePayloads[16];
@@ -2610,6 +2638,9 @@ void ensureWifiAndMqtt() {
             MqttClient.subscribe(descendants.c_str());
           }
         }
+        const String root = licorRootTopic();  // the analyzer's battery (retained)
+        MqttClient.subscribe((root + "system/Battery").c_str());
+        MqttClient.subscribe((root + "system/AC").c_str());
         sendDebug("@DBG=MQTT:CONNECTED!");
       }
     }
@@ -2840,7 +2871,8 @@ void handleCommand(const String &line) {
   } else if (line == "@WIFI=STATUS!") {
     const bool up = WiFi.status() == WL_CONNECTED;
     sendLine("@WIFI=STATUS:JOIN=" + String(g_cfg.wifiJoinEnabled ? 1 : 0) + ",CONNECTED=" + String(up ? 1 : 0) + ",SSID=" + g_cfg.wifiSsid +
-             ",IP=" + (up ? WiFi.localIP().toString() : String("-")) + ",ADDR=" + (g_cfg.wifiIp.isEmpty() ? String("dhcp") : String("fixed")) + "!");
+             ",IP=" + (up ? WiFi.localIP().toString() : String("-")) + ",ADDR=" + (g_cfg.wifiIp.isEmpty() ? String("dhcp") : String("fixed")) +
+             ",RSSI=" + (up ? String(WiFi.RSSI()) : String("-")) + "!");
   } else if (line.startsWith("@TIME=SET:") && line.endsWith("!")) {
     handleTimeSet(line.substring(10, line.length() - 1));
   } else if (line == "@TIME=GET!") {
