@@ -5,7 +5,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <TinyGPSPlus.h>
-#include <M5Unified.h>
+#include <M5AtomS3.h>
 #include <driver/twai.h>
 #include <lwip/sockets.h>
 #include <sys/time.h>
@@ -36,6 +36,14 @@ constexpr size_t kMqttRawTopicLen = 96;
 constexpr size_t kMqttRawPayloadLen = 768;
 constexpr size_t kMqttClientBufferSize = 1024;
 constexpr uint32_t kMqttReadWaitMs = 1200;
+constexpr uint8_t kLedStatusMaxPct = 40;
+constexpr uint32_t kLedPulsePeriodMs = 2000;
+constexpr uint32_t kLedFlashMs = 120;
+constexpr uint32_t kLedColorWifiDown = 0xFF0000;
+constexpr uint32_t kLedColorMqttDown = 0xFF6400;
+constexpr uint32_t kLedColorReady = 0xFFFF00;
+constexpr uint32_t kLedColorLinkRx = 0x0000FF;
+constexpr uint32_t kLedColorLinkTx = 0x00FF00;
 
 HardwareSerial LinkSerial(1);
 HardwareSerial GpsSerial(2);
@@ -188,6 +196,11 @@ int g_licorAc = -1;
 Sht4xCache g_sht4x;
 Bmp280Cache g_bmp280;
 CommandSource g_commandSource = CommandSource::Local;
+uint32_t g_ledCurrentColor = 0xFFFFFFFF;
+uint32_t g_ledFlashColor = 0;
+uint32_t g_ledFlashUntilMs = 0;
+uint32_t g_ledPendingFlashColor = 0;
+bool g_ledPendingFlash = false;
 
 String trimCopy(const String &input) {
   String out = input;
@@ -369,6 +382,70 @@ String mqttCollapseRepeatedPrefix(const String &topic) {
   }
 
   return normalized;
+}
+
+uint8_t scaleLedChannel(uint8_t channel, uint8_t pct) {
+  return static_cast<uint8_t>((static_cast<uint16_t>(channel) * pct + 50U) / 100U);
+}
+
+uint32_t scaleLedColor(uint32_t rgb, uint8_t pct) {
+  const uint8_t red = scaleLedChannel(static_cast<uint8_t>((rgb >> 16) & 0xFF), pct);
+  const uint8_t green = scaleLedChannel(static_cast<uint8_t>((rgb >> 8) & 0xFF), pct);
+  const uint8_t blue = scaleLedChannel(static_cast<uint8_t>(rgb & 0xFF), pct);
+  return (static_cast<uint32_t>(red) << 16) | (static_cast<uint32_t>(green) << 8) | blue;
+}
+
+uint32_t getStatusLedBaseColor() {
+  const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+  if (!wifiConnected) return kLedColorWifiDown;
+  if (!g_mqtt.connected) return kLedColorMqttDown;
+  return kLedColorReady;
+}
+
+uint8_t getStatusLedPulsePct() {
+  const uint32_t phase = millis() % kLedPulsePeriodMs;
+  const uint32_t halfPeriod = kLedPulsePeriodMs / 2;
+  const uint32_t ramp = phase <= halfPeriod ? phase : (kLedPulsePeriodMs - phase);
+  return static_cast<uint8_t>((ramp * kLedStatusMaxPct + (halfPeriod / 2)) / halfPeriod);
+}
+
+void setStatusLedColor(uint32_t rgb) {
+  if (g_ledCurrentColor == rgb) return;
+  g_ledCurrentColor = rgb;
+  AtomS3.dis.drawpix(CRGB(static_cast<uint8_t>((rgb >> 16) & 0xFF),
+                          static_cast<uint8_t>((rgb >> 8) & 0xFF),
+                          static_cast<uint8_t>(rgb & 0xFF)));
+}
+
+void triggerLinkLedFlash(uint32_t rgb) {
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(g_ledFlashUntilMs - now) > 0) {
+    g_ledPendingFlashColor = rgb;
+    g_ledPendingFlash = true;
+    return;
+  }
+  g_ledFlashColor = rgb;
+  g_ledFlashUntilMs = now + kLedFlashMs;
+}
+
+void updateStatusLed() {
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(g_ledFlashUntilMs - now) <= 0) {
+    if (g_ledPendingFlash) {
+      g_ledFlashColor = g_ledPendingFlashColor;
+      g_ledFlashUntilMs = now + kLedFlashMs;
+      g_ledPendingFlash = false;
+    } else {
+      g_ledFlashUntilMs = 0;
+    }
+  }
+
+  if (static_cast<int32_t>(g_ledFlashUntilMs - now) > 0) {
+    setStatusLedColor(g_ledFlashColor);
+    return;
+  }
+
+  setStatusLedColor(scaleLedColor(getStatusLedBaseColor(), getStatusLedPulsePct()));
 }
 
 void mqttBuildTopicCandidates(const String &requestedTopic, String *out, size_t cap, size_t &count) {
@@ -2514,10 +2591,13 @@ void sendLine(const String &line, ReplyChannel channel) {
       const bool ok = canSendText(id, out + "\n");
       if (!ok && channel == ReplyChannel::Response) {
         Serial.println("@CAN=ERR:RESP_TX!");
+      } else if (ok) {
+        triggerLinkLedFlash(kLedColorLinkTx);
       }
     } else {
       LinkSerial.print(out);
       LinkSerial.print('\n');
+      triggerLinkLedFlash(kLedColorLinkTx);
     }
   }
   Serial.println(out);
@@ -3005,6 +3085,7 @@ void pumpRs485Commands() {
         String command;
         String replyPrefix;
         if (parseRs485Envelope(line, command, replyPrefix)) {
+          triggerLinkLedFlash(kLedColorLinkRx);
           g_rs485ReplyPrefix = replyPrefix;
           g_commandSource = CommandSource::Rs485;
           handleCommand(command);
@@ -3069,6 +3150,7 @@ void pumpCanCommands() {
         String command;
         String replyPrefix;
         if (parseRs485Envelope(line, command, replyPrefix)) {
+          triggerLinkLedFlash(kLedColorLinkRx);
           g_rs485ReplyPrefix = replyPrefix;
           g_commandSource = CommandSource::Can;
           handleCommand(command);
@@ -3089,7 +3171,8 @@ void pumpCanCommands() {
 
 void setup() {
   auto cfg = M5.config();
-  M5.begin(cfg);
+  AtomS3.begin(cfg, true);
+  AtomS3.dis.setBrightness(100);
   Serial.begin(115200);
   delay(200);
   Wire.begin(kPortA2Sda, kPortA2Scl, 100000);
@@ -3102,6 +3185,8 @@ void setup() {
   xTaskCreatePinnedToCore(ntpTask, "ntp", 4096, nullptr, 2, nullptr, 0);
   refreshSensorCaches(true);
   updateI2cSummary();
+  updateStatusLed();
+  AtomS3.update();
   sendLine("@BOOT=OK:JUUSOFLUX_COWORKER!");
   sendLine("@I2C=STATUS:SHT4X=" + String(g_i2c.sht4xPresent ? 1 : 0) + ",BMP280=" + String(g_i2c.bmp280Present ? 1 : 0) + "!");
 }
@@ -3117,6 +3202,8 @@ void loop() {
   refreshSensorCaches();
   updateI2cSummary();
   reportStateTransitions();
+  updateStatusLed();
+  AtomS3.update();
 
   static uint32_t lastAlive = 0;
   if (g_cfg.debugEnabled && millis() - lastAlive > 5000) {
