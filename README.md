@@ -4,8 +4,9 @@ PlatformIO firmware for an M5Stack AtomS3 Lite based coworker node that:
 
 - joins a remote analyzer AP and reads MQTT data
 - reads local GPS and I2C sensors
-- exposes one remote command surface to JUUSOFLUX_HUB
-- uses either RS485 or CAN as the wired uplink to the hub
+- exposes one remote command surface to JUUSOFLUX_HUB, or to ESP_CYBERDECK (an M5Stack Tab5) as a
+  JuusoFlux "Coworker" source on one of its serial ports
+- uses either RS485 or CAN as the wired uplink to the hub (to the Tab5: RS485 levels on a TTL port)
 
 Purpose
 
@@ -16,7 +17,8 @@ Purpose
 Current status
 
 - PlatformIO Arduino project for AtomS3 Lite is operational
-- coworker TOML config is used from `data/coworker.toml`
+- date-based firmware version (`vYYYY.MM.DD`, `@VER!`), releases built by GitHub Actions from a tag
+- coworker TOML config is used from `data/coworker.toml` (see "Settings files")
 - RS485 and CAN link backends are implemented
 - ASCII command interface is implemented for config, debug, status, read, and poll-all
 - CAN segmented text protocol is implemented
@@ -28,6 +30,12 @@ Current status
 - a fixed Wi-Fi address (`[wifi] ip / mask / gateway / dns`, empty `ip` = DHCP)
 - time from the host (`@TIME=SET`) and an NTP server with it (`[ntp] enabled`), so the analyzer can
   take its time from the coworker (`@NTP=LICOR!`); see protocol.md "Time and NTP server"
+- `@POLL=ALL!` carries `WIFI_rssi` (the signal to the analyzer's AP, dBm) and the analyzer's
+  battery: `<name>_battery` (%) and `<name>_ac` (1 on mains), from its retained `system/Battery`
+  and `system/AC` MQTT topics, subscribed by themselves
+- status LED (the AtomS3 Lite's RGB LED): pulses red while Wi-Fi is down, orange while MQTT is
+  down, yellow when ready; flashes blue when a link command comes in and green when a reply goes
+  out (RS485 or CAN)
 
 Not yet completed
 
@@ -65,6 +73,28 @@ Build
 - `pio run -t upload --upload-port COM11`
 - `pio run -t uploadfs --upload-port COM11`
 - select an alternate TOML for `uploadfs` by setting `COWORKER_FS_CONFIG`, for example `set COWORKER_FS_CONFIG=coworker.li7820.toml && pio run -e juusoflux-coworker -t uploadfs --upload-port COM11`
+- the libraries are pinned (M5Unified 0.2.13, M5GFX 0.2.34, M5AtomS3, FastLED), so a release
+  build is the same as a local one
+
+Settings files (`data/`)
+
+- `coworker.toml`: the default for `uploadfs` and the full release image. Since 2026-10-22 it is
+  CW20's running settings (read with `@CFG=GET`): the LI-7820 (`TG20-01658`, MQTT name
+  `LI7820`) with the Tab5, `link.mode = rs485` at 115200 as node 20 on the Tab5's `ttl_b`, NTP
+  server on, DHCP, GPS off, no I2C sensors (they moved to the JF HUB).
+- `coworker.li7820.toml`: the same, kept under the analyzer's name.
+- `coworker.li7810.toml`: the LI-7810 coworker (`TG10-01250`) on a JF HUB's CAN bus as node 10.
+- Keys a file leaves out keep their defaults; `@CFG=SAVE!` writes every key.
+
+Release
+
+- `scripts/create_release_tag.ps1` tags the commit `vYYYY.MM.DD` (UTC) and pushes the tag; one
+  release a day (`-UpdateExisting` moves today's tag). `.github/workflows/release.yml` then builds
+  the firmware with that version (`JF_FW_VER`, `scripts/set_fw_ver.py`) and publishes:
+  - `JF_COWORKER_firmware_<ver>.bin`: the app (flash at 0x10000, or `pio run -t upload`)
+  - `JF_COWORKER_<file>_littlefs_<ver>.bin`: a LittleFS image (at 0x670000) per settings file
+  - `JF_COWORKER_full_<ver>.bin`: bootloader, partitions, app and `coworker.toml` at 0x0
+  - `SHA256SUMS_<ver>.txt`
 
 Commit and push all changes
 
@@ -85,6 +115,7 @@ From `JUUSOFLUX_COWORKER`:
 Key runtime commands
 
 - `@SYS=HELLO!`
+- `@VER!` (`@VER=COWORKER:v2026.10.22!`, also sent at boot)
 - `@CAN=STATUS!`
 - `@CAN=REINIT!`
 - `@CAN=TXTEST!`
@@ -152,7 +183,8 @@ Cache behavior
 
 Main config groups
 
-- `[wifi]`
+- `[wifi]` (`join_enabled`, `ssid`, `password`, `ip`, `mask`, `gateway`, `dns`)
+- `[ntp]` (`enabled`: the NTP server for the analyzer)
 - `[mqtt]`
 - `[gps]` (`enabled`, `baud`, `rx_gpio`, `tx_gpio`; a `gps.*` change restarts the GPS UART)
 - `[link]`

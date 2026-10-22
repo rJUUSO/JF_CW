@@ -23,6 +23,7 @@ Response style
 - examples:
 	- `@SYS=OK:JUUSOFLUX_COWORKER!`
 	- `@BOOT=OK:JUUSOFLUX_COWORKER!`
+	- `@VER=COWORKER:v2026.10.22!` (at boot too)
 	- `@CAN=STATUS:MODE=can,READY=1,...!`
 	- `@CFG=link.mode=can!`
 	- `@MQTT=RX:JSON={"licor":{"niobrara":{"output":{"concentration":{...}}}}}!`
@@ -31,7 +32,7 @@ Response style
 
 Implemented command groups
 
-- system: `@SYS=HELLO!`
+- system: `@SYS=HELLO!`, `@VER!` (the firmware's date version)
 - CAN: `@CAN=STATUS!`, `@CAN=REINIT!`, `@CAN=TXTEST!`
 - link: `@LINK=STATUS!`, `@LINK=ADDR!`
 - Wi-Fi/MQTT: `@WIFI=STATUS!`, `@MQTT=STATUS!`, `@MQTT=LAST!`, `@MQTT=READ!`, `@MQTT=READ:<topic>!`,
@@ -40,7 +41,7 @@ Implemented command groups
   `@NTP=LICOR[:<tz>]!`
 - GPS: `@GPS=STATUS!`, `@GPS=RAW!`
 - I2C: `@I2C=SCAN!`, `@I2C=LIST!`, `@I2C=SHT4X:READ!`, `@I2C=BMP280:READ!`
-- aggregate: `@POLL=ALL!`
+- aggregate: `@POLL=ALL!` (also `WIFI_rssi` and the analyzer's `<name>_battery` / `<name>_ac`)
 - config: `@CFG=GET:<key>!`, `@CFG=SET:<key>=<value>!`, `@CFG=SAVE!`, `@CFG=RELOAD!`
 - debug: `@DBG=ENABLE!`, `@DBG=DISABLE!`
 

@@ -32,6 +32,10 @@ constexpr size_t kMqttMaxFields = 48;
 constexpr size_t kMqttKeyLen = 48;
 constexpr size_t kMqttValueLen = 48;
 constexpr size_t kMqttRawCacheSlots = 128;
+#ifndef JF_FW_VER_STR
+#define JF_FW_VER_STR "0.0.0-dev"  // scripts/set_fw_ver.py sets the date (YYYY.MM.DD)
+#endif
+
 constexpr size_t kMqttRawTopicLen = 96;
 constexpr size_t kMqttRawPayloadLen = 768;
 constexpr size_t kMqttClientBufferSize = 1024;
@@ -2897,6 +2901,8 @@ void beginGps() {
 void handleCommand(const String &line) {
   if (line == "@SYS=HELLO!") {
     sendLine("@SYS=OK:JUUSOFLUX_COWORKER!");
+  } else if (line == "@VER!") {
+    sendLine(String("@VER=COWORKER:v") + JF_FW_VER_STR + "!");
   } else if (line == "@CAN=STATUS!") {
     twai_status_info_t st = {};
     if (g_cfg.linkMode == LinkMode::CAN && g_linkReady) {
@@ -3188,6 +3194,7 @@ void setup() {
   updateStatusLed();
   AtomS3.update();
   sendLine("@BOOT=OK:JUUSOFLUX_COWORKER!");
+  sendLine(String("@VER=COWORKER:v") + JF_FW_VER_STR + "!");
   sendLine("@I2C=STATUS:SHT4X=" + String(g_i2c.sht4xPresent ? 1 : 0) + ",BMP280=" + String(g_i2c.bmp280Present ? 1 : 0) + "!");
 }
 
